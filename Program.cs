@@ -55,8 +55,8 @@ namespace CosmosDBWithEventualConsistency
                 var locations = new List<CosmosDBAccountLocation>()
                 {
                     new CosmosDBAccountLocation(){ LocationName  = AzureLocation.WestUS, FailoverPriority = 0 },
-                    //new CosmosDBAccountLocation(){ LocationName  = AzureLocation.EastUS, FailoverPriority = 1 },
-                    //new CosmosDBAccountLocation(){ LocationName  = AzureLocation.CentralUS, FailoverPriority = 2 },
+                    new CosmosDBAccountLocation(){ LocationName  = AzureLocation.SoutheastAsia, FailoverPriority = 1 },
+                    new CosmosDBAccountLocation(){ LocationName  = AzureLocation.SouthAfricaNorth, FailoverPriority = 2 },
                 };
                 var dbAccountInput = new CosmosDBAccountCreateOrUpdateContent(AzureLocation.WestUS2, locations)
                 {
@@ -70,8 +70,7 @@ namespace CosmosDBWithEventualConsistency
                     {
                         new CosmosDBIPAddressOrRange()
                         {
-                            //IPAddressOrRange = Environment.GetEnvironmentVariable("Current_Machine_PublicIP")
-                            IPAddressOrRange = "167.220.233.61"
+                            IPAddressOrRange = Environment.GetEnvironmentVariable("Current_Machine_PublicIP")
                         }
                     },
                     IsVirtualNetworkFilterEnabled = true,
