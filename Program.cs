@@ -8,13 +8,19 @@ using Azure.ResourceManager.Resources.Models;
 using Azure.ResourceManager.Samples.Common;
 using Azure.ResourceManager.Resources;
 using Azure.ResourceManager;
+using Azure.ResourceManager.CosmosDB.Models;
+using Azure.ResourceManager.CosmosDB;
+using Microsoft.Azure.Documents.Client;
+using Microsoft.Azure.Documents;
 
 namespace CosmosDBWithEventualConsistency
 {
 
     public class Program
     {
-        private static ResourceIdentifier? _resourceGroupId = null; 
+        private static ResourceIdentifier? _resourceGroupId = null;
+        private const int _maxStalenessPrefix = 100000;
+        private const int _maxIntervalInSeconds = 300;
         const String DATABASE_ID = "TestDB";
         const String COLLECTION_ID = "TestCollection";
 
@@ -27,9 +33,6 @@ namespace CosmosDBWithEventualConsistency
           */
         public static async Task RunSample(ArmClient client)
         {
-            string cosmosDBName = SdkContext.RandomResourceName("docDb", 10);
-            string rgName = SdkContext.RandomResourceName("rgNEMV", 24);
-
             try
             {
                 // Get default subscription
@@ -37,7 +40,7 @@ namespace CosmosDBWithEventualConsistency
 
                 // Create a resource group in the EastUS region
                 string rgName = Utilities.CreateRandomName("CosmosDBTemplateRG");
-                Utilities.Log($"creating resource group with name:{rgName}");
+                Utilities.Log($"Creating a resource group..");
                 ArmOperation<ResourceGroupResource> rgLro = await subscription.GetResourceGroups().CreateOrUpdateAsync(WaitUntil.Completed, rgName, new ResourceGroupData(AzureLocation.EastUS));
                 ResourceGroupResource resourceGroup = rgLro.Value;
                 _resourceGroupId = resourceGroup.Id;
@@ -46,45 +49,78 @@ namespace CosmosDBWithEventualConsistency
                 //============================================================
                 // Create a CosmosDB.
 
-                Console.WriteLine("Creating a CosmosDB...");
-                ICosmosDBAccount cosmosDBAccount = azure.CosmosDBAccounts.Define(cosmosDBName)
-                        .WithRegion(Region.USWest)
-                        .WithNewResourceGroup(rgName)
-                        .WithKind(DatabaseAccountKind.GlobalDocumentDB)
-                        .WithEventualConsistency()
-                        .WithWriteReplication(Region.USEast)
-                        .WithReadReplication(Region.USCentral)
-                        .Create();
+                Utilities.Log("Creating a CosmosDB...");
+                string dbAccountName = Utilities.CreateRandomName("dbaccount");
+                CosmosDBAccountKind cosmosDBKind = CosmosDBAccountKind.GlobalDocumentDB;
+                var locations = new List<CosmosDBAccountLocation>()
+                {
+                    new CosmosDBAccountLocation(){ LocationName  = AzureLocation.WestUS, FailoverPriority = 0 },
+                    //new CosmosDBAccountLocation(){ LocationName  = AzureLocation.EastUS, FailoverPriority = 1 },
+                    //new CosmosDBAccountLocation(){ LocationName  = AzureLocation.CentralUS, FailoverPriority = 2 },
+                };
+                var dbAccountInput = new CosmosDBAccountCreateOrUpdateContent(AzureLocation.WestUS2, locations)
+                {
+                    Kind = cosmosDBKind,
+                    ConsistencyPolicy = new Azure.ResourceManager.CosmosDB.Models.ConsistencyPolicy(DefaultConsistencyLevel.BoundedStaleness)
+                    {
+                        MaxStalenessPrefix = _maxStalenessPrefix,
+                        MaxIntervalInSeconds = _maxIntervalInSeconds
+                    },
+                    IPRules =
+                    {
+                        new CosmosDBIPAddressOrRange()
+                        {
+                            //IPAddressOrRange = Environment.GetEnvironmentVariable("Current_Machine_PublicIP")
+                            IPAddressOrRange = "167.220.233.61"
+                        }
+                    },
+                    IsVirtualNetworkFilterEnabled = true,
+                    EnableAutomaticFailover = false,
+                    ConnectorOffer = ConnectorOffer.Small,
+                    DisableKeyBasedMetadataWriteAccess = false,
+                    EnableMultipleWriteLocations = true,
+                    PublicNetworkAccess = CosmosDBPublicNetworkAccess.Enabled,
+                };
 
-                Console.WriteLine("Created CosmosDB");
-                Utilities.Print(cosmosDBAccount);
+                dbAccountInput.Tags.Add("key1", "value");
+                dbAccountInput.Tags.Add("key2", "value");
+                var accountLro = await resourceGroup.GetCosmosDBAccounts().CreateOrUpdateAsync(WaitUntil.Completed, dbAccountName, dbAccountInput);
+                CosmosDBAccountResource dbAccount = accountLro.Value;
+                Utilities.Log($"Created CosmosDB {dbAccount.Id.Name}");
 
                 //============================================================
                 // Get credentials for the CosmosDB.
 
-                Console.WriteLine("Get credentials for the CosmosDB");
-                var databaseAccountListKeysResult = cosmosDBAccount.ListKeys();
-                string masterKey = databaseAccountListKeysResult.PrimaryMasterKey;
-                string endPoint = cosmosDBAccount.DocumentEndpoint;
+                Utilities.Log("Get credentials for the CosmosDB");
+                var getKeysLro = await dbAccount.GetKeysAsync();
+                CosmosDBAccountKeyList keyList = getKeysLro.Value;
+                string masterKey = keyList.PrimaryMasterKey;
+                string endPoint = dbAccount.Data.DocumentEndpoint;
+                Utilities.Log($"masterKey: {masterKey}");
+                Utilities.Log($"endPoint: {endPoint}");
 
                 //============================================================
                 // Connect to CosmosDB and add a collection
 
                 Console.WriteLine("Connecting and adding collection");
-                //CreateDBAndAddCollection(masterKey, endPoint);
+                CreateDBAndAddCollection(masterKey, endPoint);
 
                 //============================================================
                 // Delete CosmosDB
-                Console.WriteLine("Deleting the CosmosDB");
-                // work around CosmosDB service issue returning 404 CloudException on delete operation
+                Utilities.Log("Deleting the CosmosDB");
                 try
                 {
-                    azure.CosmosDBAccounts.DeleteById(cosmosDBAccount.Id);
+                    await dbAccount.DeleteAsync(WaitUntil.Completed);
                 }
-                catch (CloudException)
+                catch (Exception ex)
                 {
+                    Utilities.Log(ex.ToString());
                 }
-                Console.WriteLine("Deleted the CosmosDB");
+                Utilities.Log("Deleted the CosmosDB");
+            }
+            catch (Exception ex)
+            {
+                Utilities.Log(ex);
             }
             finally
             {
@@ -108,7 +144,7 @@ namespace CosmosDBWithEventualConsistency
             }
         }
 
-        private void CreateDBAndAddCollection(string masterKey, string endPoint)
+        private static void CreateDBAndAddCollection(string masterKey, string endPoint)
         {
             DocumentClient documentClient = new DocumentClient(new System.Uri(endPoint),
                     masterKey, ConnectionPolicy.Default,
