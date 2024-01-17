@@ -1,30 +1,26 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using Microsoft.Azure.Documents;
+using Azure;
+using Azure.Core;
+using Azure.Identity;
+using Azure.ResourceManager.Resources.Models;
+using Azure.ResourceManager.Samples.Common;
+using Azure.ResourceManager.Resources;
+using Azure.ResourceManager;
+using Azure.ResourceManager.CosmosDB.Models;
+using Azure.ResourceManager.CosmosDB;
 using Microsoft.Azure.Documents.Client;
-using Microsoft.Azure.Management.Compute.Fluent;
-using Microsoft.Azure.Management.Compute.Fluent.Models;
-using Microsoft.Azure.Management.CosmosDB.Fluent;
-using Microsoft.Azure.Management.CosmosDB.Fluent.Models;
-using Microsoft.Azure.Management.Fluent;
-using Microsoft.Azure.Management.Network.Fluent;
-using Microsoft.Azure.Management.ResourceManager.Fluent;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Core;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Core.ResourceActions;
-using Microsoft.Azure.Management.Samples.Common;
-using Microsoft.Rest.Azure;
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
+using Microsoft.Azure.Documents;
 
 namespace CosmosDBWithEventualConsistency
 {
 
     public class Program
     {
+        private static ResourceIdentifier? _resourceGroupId = null;
+        private const int _maxStalenessPrefix = 100000;
+        private const int _maxIntervalInSeconds = 300;
         const String DATABASE_ID = "TestDB";
         const String COLLECTION_ID = "TestCollection";
 
@@ -35,63 +31,106 @@ namespace CosmosDBWithEventualConsistency
           *  - add collection to the CosmosDB
           *  - Delete the CosmosDB.
           */
-        public static void RunSample(IAzure azure)
+        public static async Task RunSample(ArmClient client)
         {
-            string cosmosDBName = SdkContext.RandomResourceName("docDb", 10);
-            string rgName = SdkContext.RandomResourceName("rgNEMV", 24);
-
             try
             {
+                // Get default subscription
+                SubscriptionResource subscription = await client.GetDefaultSubscriptionAsync();
+
+                // Create a resource group in the EastUS region
+                string rgName = Utilities.CreateRandomName("CosmosDBTemplateRG");
+                Utilities.Log($"Creating a resource group..");
+                ArmOperation<ResourceGroupResource> rgLro = await subscription.GetResourceGroups().CreateOrUpdateAsync(WaitUntil.Completed, rgName, new ResourceGroupData(AzureLocation.EastUS));
+                ResourceGroupResource resourceGroup = rgLro.Value;
+                _resourceGroupId = resourceGroup.Id;
+                Utilities.Log("Created a resource group with name: " + resourceGroup.Data.Name);
+
                 //============================================================
                 // Create a CosmosDB.
 
-                Console.WriteLine("Creating a CosmosDB...");
-                ICosmosDBAccount cosmosDBAccount = azure.CosmosDBAccounts.Define(cosmosDBName)
-                        .WithRegion(Region.USWest)
-                        .WithNewResourceGroup(rgName)
-                        .WithKind(DatabaseAccountKind.GlobalDocumentDB)
-                        .WithEventualConsistency()
-                        .WithWriteReplication(Region.USEast)
-                        .WithReadReplication(Region.USCentral)
-                        .Create();
+                Utilities.Log("Creating a CosmosDB...");
+                string dbAccountName = Utilities.CreateRandomName("dbaccount");
+                CosmosDBAccountKind cosmosDBKind = CosmosDBAccountKind.GlobalDocumentDB;
+                var locations = new List<CosmosDBAccountLocation>()
+                {
+                    new CosmosDBAccountLocation(){ LocationName  = AzureLocation.WestUS, FailoverPriority = 0 },
+                    new CosmosDBAccountLocation(){ LocationName  = AzureLocation.SoutheastAsia, FailoverPriority = 1 },
+                    new CosmosDBAccountLocation(){ LocationName  = AzureLocation.SouthAfricaNorth, FailoverPriority = 2 },
+                };
+                var dbAccountInput = new CosmosDBAccountCreateOrUpdateContent(AzureLocation.WestUS2, locations)
+                {
+                    Kind = cosmosDBKind,
+                    ConsistencyPolicy = new Azure.ResourceManager.CosmosDB.Models.ConsistencyPolicy(DefaultConsistencyLevel.BoundedStaleness)
+                    {
+                        MaxStalenessPrefix = _maxStalenessPrefix,
+                        MaxIntervalInSeconds = _maxIntervalInSeconds
+                    },
+                    IPRules =
+                    {
+                        new CosmosDBIPAddressOrRange()
+                        {
+                            IPAddressOrRange = Environment.GetEnvironmentVariable("Current_Machine_PublicIP")
+                        }
+                    },
+                    IsVirtualNetworkFilterEnabled = true,
+                    EnableAutomaticFailover = false,
+                    ConnectorOffer = ConnectorOffer.Small,
+                    DisableKeyBasedMetadataWriteAccess = false,
+                    EnableMultipleWriteLocations = true,
+                    PublicNetworkAccess = CosmosDBPublicNetworkAccess.Enabled,
+                };
 
-                Console.WriteLine("Created CosmosDB");
-                Utilities.Print(cosmosDBAccount);
+                dbAccountInput.Tags.Add("key1", "value");
+                dbAccountInput.Tags.Add("key2", "value");
+                var accountLro = await resourceGroup.GetCosmosDBAccounts().CreateOrUpdateAsync(WaitUntil.Completed, dbAccountName, dbAccountInput);
+                CosmosDBAccountResource dbAccount = accountLro.Value;
+                Utilities.Log($"Created CosmosDB {dbAccount.Id.Name}");
 
                 //============================================================
                 // Get credentials for the CosmosDB.
 
-                Console.WriteLine("Get credentials for the CosmosDB");
-                var databaseAccountListKeysResult = cosmosDBAccount.ListKeys();
-                string masterKey = databaseAccountListKeysResult.PrimaryMasterKey;
-                string endPoint = cosmosDBAccount.DocumentEndpoint;
+                Utilities.Log("Get credentials for the CosmosDB");
+                var getKeysLro = await dbAccount.GetKeysAsync();
+                CosmosDBAccountKeyList keyList = getKeysLro.Value;
+                string masterKey = keyList.PrimaryMasterKey;
+                string endPoint = dbAccount.Data.DocumentEndpoint;
+                Utilities.Log($"masterKey: {masterKey}");
+                Utilities.Log($"endPoint: {endPoint}");
 
                 //============================================================
                 // Connect to CosmosDB and add a collection
 
                 Console.WriteLine("Connecting and adding collection");
-                //CreateDBAndAddCollection(masterKey, endPoint);
+                CreateDBAndAddCollection(masterKey, endPoint);
 
                 //============================================================
                 // Delete CosmosDB
-                Console.WriteLine("Deleting the CosmosDB");
-                // work around CosmosDB service issue returning 404 CloudException on delete operation
+                Utilities.Log("Deleting the CosmosDB");
                 try
                 {
-                    azure.CosmosDBAccounts.DeleteById(cosmosDBAccount.Id);
+                    await dbAccount.DeleteAsync(WaitUntil.Completed);
                 }
-                catch (CloudException)
+                catch (Exception ex)
                 {
+                    Utilities.Log(ex.ToString());
                 }
-                Console.WriteLine("Deleted the CosmosDB");
+                Utilities.Log("Deleted the CosmosDB");
+            }
+            catch (Exception ex)
+            {
+                Utilities.Log(ex);
             }
             finally
             {
                 try
                 {
-                    Utilities.Log("Deleting resource group: " + rgName);
-                    azure.ResourceGroups.BeginDeleteByName(rgName);
-                    Utilities.Log("Deleted resource group: " + rgName);
+                    if (_resourceGroupId is not null)
+                    {
+                        Utilities.Log($"Deleting Resource Group: {_resourceGroupId}");
+                        await client.GetResourceGroupResource(_resourceGroupId).DeleteAsync(WaitUntil.Completed);
+                        Utilities.Log($"Deleted Resource Group: {_resourceGroupId}");
+                    }
                 }
                 catch (NullReferenceException)
                 {
@@ -104,7 +143,7 @@ namespace CosmosDBWithEventualConsistency
             }
         }
 
-        private void CreateDBAndAddCollection(string masterKey, string endPoint)
+        private static void CreateDBAndAddCollection(string masterKey, string endPoint)
         {
             DocumentClient documentClient = new DocumentClient(new System.Uri(endPoint),
                     masterKey, ConnectionPolicy.Default,
@@ -134,24 +173,20 @@ namespace CosmosDBWithEventualConsistency
                     .GetAwaiter().GetResult();
         }
 
-        public static void Main(string[] args)
+        public static async Task Main(string[] args)
         {
             try
             {
                 //=================================================================
                 // Authenticate
-                var credentials = SdkContext.AzureCredentialsFactory.FromFile(Environment.GetEnvironmentVariable("AZURE_AUTH_LOCATION"));
+                var clientId = Environment.GetEnvironmentVariable("CLIENT_ID");
+                var clientSecret = Environment.GetEnvironmentVariable("CLIENT_SECRET");
+                var tenantId = Environment.GetEnvironmentVariable("TENANT_ID");
+                var subscription = Environment.GetEnvironmentVariable("SUBSCRIPTION_ID");
+                ClientSecretCredential credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+                ArmClient client = new ArmClient(credential, subscription);
 
-                var azure = Azure
-                    .Configure()
-                    .WithLogLevel(HttpLoggingDelegatingHandler.Level.Basic)
-                    .Authenticate(credentials)
-                    .WithDefaultSubscription();
-
-                // Print selected subscription
-                Utilities.Log("Selected subscription: " + azure.SubscriptionId);
-
-                RunSample(azure);
+                await RunSample(client);
             }
             catch (Exception e)
             {
